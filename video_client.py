@@ -3,6 +3,8 @@ import mimetypes
 import os
 from typing import Optional
 
+import apply_zoom
+
 CONNECT_TIMEOUT_S = 10
 # Загрузка большого файла по медленной сети занимает время, поэтому таймаут чтения щедрый.
 READ_TIMEOUT_S = 300
@@ -38,9 +40,15 @@ def UploadVideo(server_url: str, video_path: str, company_name: str) -> str:
     filename = os.path.basename(video_path)
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     with open(video_path, "rb") as f:
+        files = {"file": (filename, f, content_type)}
+        # Sidecar с zoom-событиями лежит рядом с видео; по нему сервис отрендерит zoom.
+        zoom_path = apply_zoom.sidecar_path(video_path)
+        if os.path.exists(zoom_path):
+            with open(zoom_path, "rb") as zoom:
+                files["zoom"] = (os.path.basename(zoom_path), zoom.read(), "application/json")
         response = requests.post(
             _endpoint(server_url, "upload"),
-            files={"file": (filename, f, content_type)},
+            files=files,
             data={"company_name": company_name},
             timeout=(CONNECT_TIMEOUT_S, READ_TIMEOUT_S),
         )

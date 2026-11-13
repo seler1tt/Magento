@@ -21,6 +21,11 @@ def _parse_args():
         type=float,
         help="сколько секунд показывать видео; 0 — до нажатия Enter; по умолчанию — до конца видео",
     )
+    parser.add_argument(
+        "--no-auto-zoom",
+        action="store_true",
+        help="сценарий не включает zoom сам; zoom-события записываются только по F5",
+    )
     args = parser.parse_args()
     if args.view_seconds is not None and args.view_seconds < 0:
         parser.error("--view-seconds must be >= 0")
@@ -43,6 +48,7 @@ def _upload_and_preview(server_url, video_path, company_name, view_seconds):
 
 def main():
     args = _parse_args()
+    qscript.AUTO_ZOOM = not args.no_auto_zoom
     # utf-8-sig: Excel сохраняет UTF-8 с BOM, иначе первая колонка не совпала бы с "URL".
     with open("input.csv", encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f, delimiter=";", quotechar='"')

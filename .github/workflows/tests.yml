@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Юнит-тесты zoom-логики, как локально: python -m pytest
+  unit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9.13"
+      # На Linux pip собирает mod-wsgi и psycopg2 из исходников: нужны заголовки Apache и libpq.
+      - run: sudo apt-get update && sudo apt-get install -y apache2-dev libpq-dev
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -v
+
+  # Интеграция: поднимает Docker-стек и проверяет ffmpeg в образах и zoom-обработку.
+  docker:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9.13"
+      - run: pip install "pytest>=7,<9" "requests>=2.28,<3"
+      # .env не хранится в git: для CI создаём свой, с тестовым паролем.
+      - run: printf 'DB_NAME=videos\nDB_USER=videos\nDB_PASSWORD=ci-password\n' > .env
+      - run: docker compose up --build -d
+      - name: Wait for web service
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8000/videos > /dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Integration tests
+        env:
+          ZOOM_SERVICE_URL: http://127.0.0.1:8000
+        run: python -m pytest -v tests/test_docker_integration.py
+      - name: Docker logs
+        if: failure()
+        run: docker compose logs

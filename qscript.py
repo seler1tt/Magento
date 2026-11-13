@@ -1,4 +1,5 @@
 """Сценарий записи видео: открыть страницу, найти запрос, кликнуть первый результат."""
+import json
 import math
 import os
 import random
@@ -10,11 +11,15 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+import apply_zoom
+
 PATH_TO_VIDEO_FOLDER = "./video"
 
 # DuckDuckGo отвечает страницей ошибки 418 на поиск из headless Chromium, поэтому окно видимое.
 HEADLESS = False
 VIDEO_SIZE = {"width": 1280, "height": 720}
+# Playwright записывает видео с частотой 25 кадров/с.
+VIDEO_FPS = 25
 
 SEL_SEARCH_BOX = 'textarea[name="q"]'
 SEL_SEARCH_BUTTON = 'form button[type="submit"]'
@@ -32,6 +37,14 @@ MOVE_TICK_MS = 8
 AIM_PAUSE_MS = 200
 CURSOR_START = (80, 80)
 
+ZOOM_FACTOR = 2.0
+ZOOM_RAMP_SEC = 0.5
+ZOOM_RING_MS = 800
+# Сценарий сам показывает zoom на первом результате; capture_video.py --no-auto-zoom отключает это,
+# и zoom-события тогда приходят только от F5.
+AUTO_ZOOM = True
+AUTO_ZOOM_HOLD_MS = 2_000
+
 # Оверлей живёт в shadow DOM, чтобы CSS сайта на него не влиял. Он собран через DOM API
 # и Web Animations: innerHTML и <style> могут быть запрещены политиками CSP сайта.
 OVERLAY_SCRIPT = r"""
@@ -41,6 +54,8 @@ OVERLAY_SCRIPT = r"""
   const RIPPLE_MS = __RIPPLE_MS__;
   const CALLOUT_FADE_MS = __CALLOUT_FADE_MS__;
   const CALLOUT_HOLD_MS = __CALLOUT_HOLD_MS__;
+  const ZOOM_RING_MS = __ZOOM_RING_MS__;
+  const ZOOM_RING_COLORS = { in: "#00c853", out: "#2962ff" };
   const HIGHLIGHT_RADIUS = 32;
   const TIP = 2;  // координата острия стрелки внутри SVG
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -62,6 +77,9 @@ OVERLAY_SCRIPT = r"""
   const ripples = document.createElement("div");
   root.appendChild(ripples);
 
+  const zoomRings = document.createElement("div");
+  root.appendChild(zoomRings);
+
   const arrow = document.createElementNS(SVG_NS, "svg");
   arrow.setAttribute("width", "32");
   arrow.setAttribute("height", "32");
@@ -77,8 +95,10 @@ OVERLAY_SCRIPT = r"""
   root.appendChild(arrow);
 
   let pointerSeen = false;
+  let cursor = null;
 
   function setPos(x, y) {
+    cursor = [x, y];
     highlight.style.display = arrow.style.display = "block";
     highlight.style.transform =
       `translate(${x - HIGHLIGHT_RADIUS}px, ${y - HIGHLIGHT_RADIUS}px)`;
@@ -100,6 +120,32 @@ OVERLAY_SCRIPT = r"""
       ],
       { duration: RIPPLE_MS, fill: "forwards" }
     ).onfinish = () => wave.remove();
+  }
+
+  // Кольцо показывает оператору, что zoom переключился: зелёное — zoom-in, синее — zoom-out.
+  function zoomRing(x, y, type) {
+    const ring = document.createElement("div");
+    ring.style.cssText = "position:absolute;box-sizing:border-box;border-radius:50%;" +
+                         `border:6px solid ${ZOOM_RING_COLORS[type]};` +
+                         `width:${HIGHLIGHT_RADIUS * 4}px;height:${HIGHLIGHT_RADIUS * 4}px;` +
+                         `left:${x - HIGHLIGHT_RADIUS * 2}px;top:${y - HIGHLIGHT_RADIUS * 2}px;`;
+    zoomRings.appendChild(ring);
+    ring.animate(
+      [
+        { transform: "scale(.3)", opacity: 1 },
+        { transform: "scale(1)", opacity: 0 },
+      ],
+      { duration: ZOOM_RING_MS, fill: "forwards" }
+    ).onfinish = () => ring.remove();
+  }
+
+  // Состояние zoom хранит Python: оно должно пережить переход на другую страницу.
+  // Время берётся здесь, в момент нажатия: Python обработает вызов только при следующем
+  // обращении сценария к Playwright.
+  async function zoomAt(x, y) {
+    const type = await window.__qsZoomToggle(x, y, Date.now());
+    zoomRing(x, y, type);
+    return type;
   }
 
   async function showCallout(text, bgColor, textColor, fade) {
@@ -128,8 +174,21 @@ OVERLAY_SCRIPT = r"""
     setPos(e.clientX, e.clientY);
   }, true);
   window.addEventListener("mousedown", (e) => ripple(e.clientX, e.clientY), true);
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== "F5") return;
+    // Иначе F5 перезагрузил бы страницу.
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (e.repeat) return;
+    if (cursor) {
+      zoomAt(...cursor);
+    } else {
+      window.__qsGetCursor().then(([x, y]) => zoomAt(x, y));
+    }
+  }, true);
 
   window.__qsOverlay = { showCallout };
+  window.__zoomAt = zoomAt;
 
   // Новый документ начинается без курсора: восстанавливаем позицию из Python сразу,
   // не дожидаясь следующего движения мыши.
@@ -147,7 +206,8 @@ OVERLAY_SCRIPT = r"""
 })();
 """.replace("__RIPPLE_MS__", str(RIPPLE_MS)) \
    .replace("__CALLOUT_FADE_MS__", str(CALLOUT_FADE_MS)) \
-   .replace("__CALLOUT_HOLD_MS__", str(CALLOUT_HOLD_MS))
+   .replace("__CALLOUT_HOLD_MS__", str(CALLOUT_HOLD_MS)) \
+   .replace("__ZOOM_RING_MS__", str(ZOOM_RING_MS))
 
 # Сигнатура ShowCallout задана заданием и не содержит страницы, поэтому страница текущего сценария
 # хранится здесь.
@@ -203,6 +263,61 @@ class _Cursor:
         self.page.mouse.down()
         self.page.wait_for_timeout(RIPPLE_MS)
         self.page.mouse.up()
+
+
+class _ZoomRecorder:
+    """Zoom-события записи: каждое нажатие F5 или вызов window.__zoomAt переключает zoom-in / zoom-out."""
+
+    def __init__(self):
+        self.events = []
+        # time.time() момента, который в видео соответствует t=0.
+        self.video_started = None
+
+    def toggle(self, x, y, timestamp_ms):
+        zoomed = bool(self.events) and self.events[-1]["type"] == "in"
+        kind = "out" if zoomed else "in"
+        self.events.append({
+            "t": round(max(timestamp_ms / 1000 - self.video_started, 0), 3),
+            "x": round(x),
+            "y": round(y),
+            "type": kind,
+        })
+        return kind
+
+    def write_sidecar(self, video_path):
+        """Пишет <видео>.zoom.json, только если были события; возвращает путь или None."""
+        path = apply_zoom.sidecar_path(video_path)
+        if not self.events:
+            # Sidecar от прошлой записи с тем же именем применился бы к новому видео.
+            if os.path.exists(path):
+                os.remove(path)
+            return None
+        data = {
+            "viewport": dict(VIDEO_SIZE),
+            "fps": VIDEO_FPS,
+            "zoom_factor": ZOOM_FACTOR,
+            "ramp_sec": ZOOM_RAMP_SEC,
+            "events": self.events,
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return path
+
+
+def _zoom_at(page, x, y):
+    """То же переключение zoom, что и F5, но в заданной точке."""
+    return page.evaluate("([x, y]) => window.__zoomAt(x, y)", [x, y])
+
+
+def _zoom_on(page, cursor, locator):
+    # Как оператор с F5: сначала мышь к цели, затем zoom в точке курсора.
+    cursor.move_to(*_center(locator))
+    page.wait_for_timeout(AIM_PAUSE_MS)
+    _zoom_at(page, cursor.x, cursor.y)
+    page.wait_for_timeout(AUTO_ZOOM_HOLD_MS)
+    _zoom_at(page, cursor.x, cursor.y)
+    # Zoom-out длится ZOOM_RAMP_SEC уже в обработанном видео: клик начнётся после него.
+    page.wait_for_timeout(ZOOM_RAMP_SEC * 1000)
 
 
 def _center(locator):
@@ -280,6 +395,8 @@ def _run_sample_behavior(page, cursor, url, query, company_name):
 
     first_result = _wait_for_first_result(page)
     page.wait_for_timeout(800)
+    if AUTO_ZOOM:
+        _zoom_on(page, cursor, first_result)
     results_url = page.url
     cursor.click(first_result)
 
@@ -325,9 +442,14 @@ def CaptureVideo_Magento(
                     record_video_size=VIDEO_SIZE,
                 )
                 cursor = _Cursor()
+                zoom = _ZoomRecorder()
                 context.expose_function("__qsGetCursor", cursor.position)
+                context.expose_function("__qsZoomToggle", zoom.toggle)
                 context.add_init_script(OVERLAY_SCRIPT)
                 page = context.new_page()
+                # t=0 zoom-событий. Запись начинается при создании страницы, но первый кадр видео
+                # появляется позже: момент после new_page() ближе к нему, чем создание context.
+                zoom.video_started = time.time()
                 cursor.page = page
                 page.mouse.move(*CURSOR_START)
                 _active_page = page
@@ -335,6 +457,7 @@ def CaptureVideo_Magento(
                 _run_sample_behavior(page, cursor, url, query, company_name)
                 context.close()
                 os.replace(video.path(), target)
+                zoom.write_sidecar(target)
                 return target
             finally:
                 _active_page = None

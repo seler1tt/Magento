@@ -2,8 +2,9 @@ FROM python:3.9-slim-bookworm
 
 # apache2-dev и gcc нужны, чтобы pip собрал mod_wsgi под Python этого образа, libpq-dev — для psycopg2.
 # curl — для проверки изнутри контейнера: docker compose exec web curl http://localhost/
+# ffmpeg — для zoom-обработки (apply_zoom.py), которую выполняет сервис worker из этого же образа.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libc6-dev libpq-dev curl \
+    && apt-get install -y --no-install-recommends apache2 apache2-dev gcc libc6-dev libpq-dev curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,7 +21,7 @@ RUN a2dissite 000-default && a2ensite video \
     && ln -sf /dev/stdout /var/log/apache2/access.log \
     && ln -sf /dev/stderr /var/log/apache2/error.log
 
-COPY web_service.py web_service.wsgi ./
+COPY web_service.py web_service.wsgi apply_zoom.py worker.py ./
 # Новый именованный том uploads получает владельца этой папки, и Apache (www-data) может в него писать.
 RUN mkdir -p uploads && chown www-data:www-data uploads
 

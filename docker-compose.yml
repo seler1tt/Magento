@@ -1,3 +1,10 @@
+x-db-env: &db-env
+  DB_HOST: db
+  DB_PORT: 5432
+  DB_NAME: ${DB_NAME:?DB_NAME is not set, copy .env.example to .env}
+  DB_USER: ${DB_USER:?DB_USER is not set, copy .env.example to .env}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is not set, copy .env.example to .env}
+
 services:
   web:
     build: .
@@ -5,15 +12,25 @@ services:
       - "8000:80"
     volumes:
       - uploads:/app/uploads
-    environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: ${DB_NAME:?DB_NAME is not set, copy .env.example to .env}
-      DB_USER: ${DB_USER:?DB_USER is not set, copy .env.example to .env}
-      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is not set, copy .env.example to .env}
+    environment: *db-env
     depends_on:
       db:
         condition: service_healthy
+
+  # Zoom-обработка загруженных видео: тот же образ (в нём ffmpeg), общий с web том uploads.
+  worker:
+    build: .
+    command: ["python", "worker.py"]
+    # Как Apache: web должен иметь право удалять файлы, созданные worker, и наоборот.
+    user: www-data
+    volumes:
+      - uploads:/app/uploads
+    environment: *db-env
+    depends_on:
+      db:
+        condition: service_healthy
+    # Обрыв соединения с базой завершает worker; без перезапуска обработка остановилась бы.
+    restart: unless-stopped
 
   db:
     image: postgres:16

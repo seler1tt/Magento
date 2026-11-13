@@ -6,3 +6,4 @@ requests>=2.28,<3
 psycopg2==2.9.12
 # Built only inside the Linux web container (needs apache2-dev); skipped on the Windows host.
 mod-wsgi>=5,<6; sys_platform == "linux"
+pytest>=7,<9

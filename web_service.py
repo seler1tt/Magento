@@ -10,8 +10,12 @@ import psycopg2
 from flask import Flask, abort, g, jsonify, request, send_from_directory
 from psycopg2.extras import RealDictCursor
 
+import apply_zoom
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+# Результаты worker.py; отдаются по /media/processed/.
+PROCESSED_DIR = os.path.join(UPLOAD_DIR, "processed")
 
 DB_CONNECT_TIMEOUT_S = 10
 # Сколько ждать готовности базы при старте: 30 попыток по 2 с.
@@ -30,6 +34,14 @@ CREATE TABLE IF NOT EXISTS videos (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Zoom-обработка (worker.py). ADD COLUMN IF NOT EXISTS дополняет таблицу, созданную без этих колонок.
+-- processing_status: pending -> processing -> done | skipped (нет sidecar) | failed.
+ALTER TABLE videos
+    ADD COLUMN IF NOT EXISTS zoom_path           TEXT,
+    ADD COLUMN IF NOT EXISTS processing_status   TEXT NOT NULL DEFAULT 'pending',
+    ADD COLUMN IF NOT EXISTS processing_error    TEXT,
+    ADD COLUMN IF NOT EXISTS processed_file_path TEXT,
+    ADD COLUMN IF NOT EXISTS processed_video_url TEXT;
 """
 
 # В Python до 3.11 и в части реестров Windows для .webm нет типа: файл отдавался бы как
@@ -68,7 +80,7 @@ def _wait_for_db():
 
 
 def init_storage():
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
     conn = _wait_for_db()
     try:
         with conn, conn.cursor() as cur:
@@ -127,19 +139,30 @@ def _extension(filename):
 
 
 def _pick_filename(cur, company_name, ext):
-    """"A/B" и "A B" дают одно имя файла: чужой файл не перезаписываем, а добавляем суффикс."""
+    """"A/B" и "A B" дают одно имя файла: чужой файл не перезаписываем, а добавляем суффикс.
+
+    Уникальным должно быть и имя без расширения: от него строятся <имя>.zoom.json и processed/<имя>.webm."""
     base = _base_filename(company_name)
     n = 1
     while True:
-        name = f"{base}{ext}" if n == 1 else f"{base}_{n}{ext}"
+        stem = base if n == 1 else f"{base}_{n}"
         cur.execute(
-            "SELECT company_name FROM videos WHERE file_path = %s",
-            (os.path.join(UPLOAD_DIR, name),),
+            r"SELECT 1 FROM videos WHERE regexp_replace(file_path, '\.[^./]*$', '') = %s"
+            " AND company_name <> %s",
+            (os.path.join(UPLOAD_DIR, stem), company_name),
         )
-        owner = cur.fetchone()
-        if owner is None or owner["company_name"] == company_name:
-            return name
+        if cur.fetchone() is None:
+            return f"{stem}{ext}"
         n += 1
+
+
+def _remove_quietly(path):
+    if path is None:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _video_url(filename):
@@ -147,11 +170,20 @@ def _video_url(filename):
     return f"{request.host_url}media/{quote(filename)}"
 
 
+def _save_temp(file):
+    fd, tmp_path = tempfile.mkstemp(dir=UPLOAD_DIR, suffix=".part")
+    os.close(fd)
+    file.save(tmp_path)
+    return tmp_path
+
+
 @app.post("/upload")
 def upload_video():
-    """UploadVideo: multipart/form-data с полями file и company_name."""
+    """UploadVideo: multipart/form-data с полями file и company_name;
+    необязательное поле zoom — sidecar <видео>.zoom.json, по нему worker.py отрендерит zoom."""
     company_name = (request.form.get("company_name") or "").strip()
     file = request.files.get("file")
+    zoom_file = request.files.get("zoom")
     if not company_name:
         return _error(400, "company_name is required")
     if file is None or not file.filename:
@@ -162,45 +194,69 @@ def upload_video():
 
     # Файл сначала целиком пишется во временный: блокировка базы не держится, пока идёт загрузка,
     # а оборванная загрузка не портит уже сохранённое видео.
-    fd, tmp_path = tempfile.mkstemp(dir=UPLOAD_DIR, suffix=".part")
-    os.close(fd)
+    tmp_paths = []
     try:
-        file.save(tmp_path)
+        tmp_path = _save_temp(file)
+        tmp_paths.append(tmp_path)
+        tmp_zoom_path = None
+        if zoom_file is not None and zoom_file.filename:
+            tmp_zoom_path = _save_temp(zoom_file)
+            tmp_paths.append(tmp_zoom_path)
+            try:
+                apply_zoom.load_sidecar(tmp_zoom_path)
+            except ValueError as exc:
+                return _error(400, str(exc))
         # with conn: COMMIT при успехе, ROLLBACK при исключении.
         with get_db() as conn, conn.cursor() as cur:
             # EXCLUSIVE не мешает чтению, но выстраивает загрузки в очередь:
             # иначе две параллельные загрузки могли бы выбрать одно и то же имя файла.
             cur.execute("LOCK TABLE videos IN EXCLUSIVE MODE")
-            cur.execute("SELECT file_path FROM videos WHERE company_name = %s", (company_name,))
+            cur.execute(
+                "SELECT file_path, zoom_path, processed_file_path FROM videos WHERE company_name = %s",
+                (company_name,),
+            )
             previous = cur.fetchone()
             filename = _pick_filename(cur, company_name, ext)
             file_path = os.path.join(UPLOAD_DIR, filename)
             video_url = _video_url(filename)
+            zoom_path = apply_zoom.sidecar_path(file_path) if tmp_zoom_path else None
             os.replace(tmp_path, file_path)
+            if zoom_path:
+                os.replace(tmp_zoom_path, zoom_path)
+            # Новое видео снова ждёт обработки: прежний результат к нему не относится. Удаляем его
+            # под блокировкой: после COMMIT worker может записать новый результат по тому же пути.
+            if previous is not None:
+                _remove_quietly(previous["processed_file_path"])
             cur.execute(
                 """
-                INSERT INTO videos (company_name, file_path, video_url) VALUES (%s, %s, %s)
+                INSERT INTO videos (company_name, file_path, video_url, zoom_path) VALUES (%s, %s, %s, %s)
                 ON CONFLICT (company_name) DO UPDATE SET
-                    file_path  = EXCLUDED.file_path,
-                    video_url  = EXCLUDED.video_url,
-                    updated_at = NOW()
+                    file_path           = EXCLUDED.file_path,
+                    video_url           = EXCLUDED.video_url,
+                    zoom_path           = EXCLUDED.zoom_path,
+                    processing_status   = 'pending',
+                    processing_error    = NULL,
+                    processed_file_path = NULL,
+                    processed_video_url = NULL,
+                    updated_at          = NOW()
                 """,
-                (company_name, file_path, video_url),
+                (company_name, file_path, video_url, zoom_path),
             )
     except OSError as exc:
         # Например, в Windows файл нельзя заменить, пока его кто-то воспроизводит.
         app.logger.exception("Upload failed for %r", company_name)
         return _error(500, f"Could not store the file: {exc.strerror or exc}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        for path in tmp_paths:
+            if os.path.exists(path):
+                os.remove(path)
 
-    # Повторная загрузка с другим расширением оставила бы старый файл сиротой.
-    if previous is not None and previous["file_path"] != file_path:
-        try:
-            os.remove(previous["file_path"])
-        except OSError:
-            pass
+    if previous is not None:
+        # Повторная загрузка с другим расширением или без sidecar оставила бы старые файлы сиротами.
+        if previous["file_path"] != file_path:
+            _remove_quietly(previous["file_path"])
+        if previous["zoom_path"] != zoom_path:
+            _remove_quietly(previous["zoom_path"])
 
     return jsonify({"company_name": company_name, "video_url": video_url})
 
@@ -236,7 +292,8 @@ def media(filename):
 def list_videos():
     with get_db().cursor() as cur:
         cur.execute(
-            "SELECT company_name, file_path, video_url, created_at, updated_at"
+            "SELECT company_name, file_path, video_url, processing_status, processed_video_url,"
+            " processing_error, created_at, updated_at"
             " FROM videos ORDER BY company_name"
         )
         rows = cur.fetchall()
